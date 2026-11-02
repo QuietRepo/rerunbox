@@ -57,7 +57,7 @@ mostly idles.
 ## Install
 
 ```bash
-git clone https://github.com/YOUR-USER/rerunbox.git
+git clone https://github.com/QuietRepo/rerunbox.git
 cd rerunbox
 sudo bash install.sh
 ```
