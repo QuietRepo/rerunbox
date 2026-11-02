@@ -1,0 +1,11 @@
+[Unit]
+Description=Fire the RerunBox scheduled restart every @HOURS@ hours
+
+[Timer]
+# Counted from when the timer is activated (install, or boot), then repeating.
+# It fires blind: no time-of-day targeting and no clip-boundary awareness.
+OnActiveSec=@HOURS@h
+OnUnitActiveSec=@HOURS@h
+
+[Install]
+WantedBy=timers.target

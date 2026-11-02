@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# rerunbox-relay: the ONE persistent process that owns the outbound connection.
+#
+# It reads a continuous MPEG-TS stream from the FIFO and pushes it, untouched
+# (stream copy, no re-encoding), to your RTMP destination. Because it never
+# sees file boundaries, nothing about clip transitions can confuse it; the
+# feeder resets every clip to a clean timestamp baseline before it reaches
+# the pipe.
+set -u
+RB_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$RB_ROOT/lib/common.sh"
+rb_load_config
+
+[ -n "$RTMP_URL" ] || rb_die "RTMP_URL is not set in $RB_SECRETS"
+
+mkdir -p "$STATE_DIR"
+[ -p "$FIFO" ] || mkfifo -m 600 "$FIFO"
+
+# exec: signals from systemd reach ffmpeg directly.
+# Note: ffmpeg may print the destination URL (and so your stream key) in some
+# error messages. Treat the journal as sensitive.
+exec ffmpeg -hide_banner -loglevel warning -nostats -y \
+    -f mpegts -i "$FIFO" \
+    -c:v copy -c:a copy \
+    -f flv "$RTMP_URL"

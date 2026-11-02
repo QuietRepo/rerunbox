@@ -1,0 +1,22 @@
+# Real configuration and secrets must never be committed
+rerunbox.conf
+secrets.env
+*.env
+!config/secrets.env.example
+client_secret*.json
+*credentials*
+*.token
+*.bak-*
+
+# Runtime state
+*.fifo
+*.state
+*.log
+
+# Editor / OS / Python noise
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# rerunbox-webhook: loads the config and launches lib/webhook.py.
+set -u
+RB_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$RB_ROOT/lib/common.sh"
+rb_load_config
+
+[ -n "$WEBHOOK_TOKEN" ] || rb_die "WEBHOOK_TOKEN is not set in $RB_SECRETS"
+
+export WEBHOOK_TOKEN WEBHOOK_BIND WEBHOOK_PORT STATE_DIR
+exec python3 "$RB_ROOT/lib/webhook.py"

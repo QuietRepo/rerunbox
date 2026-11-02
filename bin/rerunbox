@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# rerunbox: command-line control and diagnostics for RerunBox.
+set -u
+RB_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$RB_ROOT/lib/common.sh"
+# shellcheck source=../lib/pipeline.sh
+. "$RB_ROOT/lib/pipeline.sh"
+rb_load_config
+
+usage() {
+    cat <<'EOF'
+Usage: rerunbox <command> [args]
+
+Control
+  status                 service state, current clip, recent feeder log
+  start | stop           start or stop the loop (relay + feeder)
+  restart                stop, then start
+  reset                  forget the resume position; start again from file #1
+  logs [-f]              show (or follow) feeder + relay logs
+
+Diagnostics
+  doctor                 check the system, config and services
+  preflight              push every library file through the real encoder for
+                         5 s and report any that fail
+  test-encode [FILE] [SECONDS] [OFFSET]
+                         encode a sample flat-out and report speed and bitrate
+                         (defaults: first library file, 20 s, offset 0)
+
+Other
+  token                  print the webhook token (needs root or group access)
+  config                 show the effective configuration (secrets hidden)
+  version
+EOF
+}
+
+# Re-run this same command as the service user. Encoder tests must run as that
+# user to prove the service itself can open the GPU and read your media.
+as_service_user() {
+    [ "$(id -un)" = "$SERVICE_USER" ] && return 0      # already the service user
+    id "$SERVICE_USER" >/dev/null 2>&1 || return 0     # not installed: run as ourselves
+    exec sudo -u "$SERVICE_USER" -- "$RB_ROOT/bin/rerunbox" "$@"
+}
+
+ok()   { printf '  [ ok ] %s\n' "$*"; }
+warn() { printf '  [warn] %s\n' "$*"; }
+bad()  { printf '  [FAIL] %s\n' "$*"; DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); }
+
+cmd_status() {
+    local u
+    for u in "$RB_RELAY_UNIT" "$RB_FEEDER_UNIT" "$RB_WEBHOOK_UNIT" "$RB_TIMER_UNIT"; do
+        printf '%-28s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"
+    done
+    if [ -r "$STATE_FILE" ]; then
+        printf '\nNow playing: %s\n' "$(basename "$(cat "$STATE_FILE")")"
+    fi
+    printf '\nRecent feeder log:\n'
+    journalctl -u "$RB_FEEDER_UNIT" --no-pager -n 8 -o cat 2>/dev/null \
+        || echo "  (no access to the journal; try: sudo rerunbox status)"
+}
+
+cmd_logs() {
+    local follow=()
+    [ "${1:-}" = "-f" ] && follow=(-f)
+    journalctl -u "$RB_FEEDER_UNIT" -u "$RB_RELAY_UNIT" --no-pager -o short-iso "${follow[@]}"
+}
+
+cmd_reset() {
+    rb_sudo rm -f "$STATE_FILE"
+    rb_sudo systemctl stop "$RB_FEEDER_UNIT"
+    rb_sudo systemctl start "$RB_FEEDER_UNIT"
+    echo "Resume position cleared; feeder restarted from the first file."
+}
+
+cmd_token() {
+    if [ -n "$WEBHOOK_TOKEN" ]; then echo "$WEBHOOK_TOKEN"; return; fi
+    rb_sudo sh -c ". '$RB_SECRETS'; printf '%s\n' \"\$WEBHOOK_TOKEN\""
+}
+
+cmd_config() {
+    echo "# $RB_CONF"
+    grep -Ev '^\s*(#|$)' "$RB_CONF" 2>/dev/null || echo "(not found)"
+    echo
+    echo "# secrets ($RB_SECRETS)"
+    local k
+    for k in RTMP_URL WEBHOOK_TOKEN DISCORD_WEBHOOK_URL; do
+        if rb_sudo grep -Eq "^${k}=\"[^\"]+\"" "$RB_SECRETS" 2>/dev/null; then
+            echo "$k: set"
+        else
+            echo "$k: not set"
+        fi
+    done
+}
+
+cmd_doctor() {
+    DOCTOR_FAILS=0
+    echo "RerunBox $(rb_version) doctor"
+    echo
+    echo "Configuration"
+    if [ -r "$RB_CONF" ]; then ok "config file $RB_CONF"; else bad "cannot read $RB_CONF"; fi
+    local verr
+    if verr="$(rb_validate_config 2>&1)"; then ok "settings are valid"; else bad "invalid settings: $(tr '\n' ' ' <<<"$verr")"; fi
+    if rb_sudo grep -Eq '^RTMP_URL="rtmps?://' "$RB_SECRETS" 2>/dev/null; then
+        ok "RTMP_URL is set"
+    else
+        bad "RTMP_URL is missing or not an rtmp:// / rtmps:// URL in $RB_SECRETS"
+    fi
+    if rb_sudo grep -Eq '^WEBHOOK_TOKEN="[^"]+"' "$RB_SECRETS" 2>/dev/null; then ok "WEBHOOK_TOKEN is set"; else warn "WEBHOOK_TOKEN is not set (webhook will not start)"; fi
+
+    echo; echo "Content"
+    if [ -d "$LIBRARY_DIR" ]; then
+        rb_list_media "$LIBRARY_DIR"
+        if [ "${#MEDIA_FILES[@]}" -gt 0 ]; then ok "${#MEDIA_FILES[@]} media file(s) in $LIBRARY_DIR"; else bad "no media files in $LIBRARY_DIR (extensions: $EXTENSIONS)"; fi
+        if id "$SERVICE_USER" >/dev/null 2>&1; then
+            if rb_sudo -u "$SERVICE_USER" test -r "${MEDIA_FILES[0]:-$LIBRARY_DIR}" 2>/dev/null; then ok "service user '$SERVICE_USER' can read the library"; else bad "service user '$SERVICE_USER' cannot read the library (check folder permissions or NAS mount options)"; fi
+        fi
+    else
+        bad "LIBRARY_DIR '$LIBRARY_DIR' does not exist"
+    fi
+    if [ -n "$AD_DIR" ]; then
+        if [ -d "$AD_DIR" ]; then rb_list_media "$AD_DIR"; ok "ad folder has ${#MEDIA_FILES[@]} file(s)"; else bad "AD_DIR '$AD_DIR' does not exist"; fi
+    fi
+    if [ -n "$OVERLAY_PNG" ]; then
+        if [ -f "$OVERLAY_PNG" ]; then ok "overlay $OVERLAY_PNG"; else bad "OVERLAY_PNG '$OVERLAY_PNG' does not exist"; fi
+    fi
+
+    echo; echo "Encoder"
+    if command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then ok "ffmpeg + ffprobe installed"; else bad "ffmpeg/ffprobe not installed"; fi
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_vaapi; then ok "ffmpeg has h264_vaapi"; else bad "this ffmpeg build has no h264_vaapi encoder"; fi
+    if [ -e "$VAAPI_DEVICE" ]; then ok "GPU device $VAAPI_DEVICE"; else bad "GPU device $VAAPI_DEVICE not found"; fi
+    if command -v vainfo >/dev/null; then
+        local vi
+        vi="$(vainfo --display drm --device "$VAAPI_DEVICE" 2>&1)"
+        if grep -q 'VAProfileH264.*VAEntrypointEncSlice' <<<"$vi"; then ok "driver offers H.264 encode"; else bad "driver does not offer H.264 encode (install intel-media-va-driver; very old GPUs are unsupported)"; fi
+        grep -q 'iHD' <<<"$vi" || warn "not using the Intel iHD driver; only Intel iHD is tested"
+    else
+        warn "vainfo not installed, skipping driver check"
+    fi
+    if id "$SERVICE_USER" >/dev/null 2>&1; then
+        ok "service user '$SERVICE_USER' exists"
+        local g
+        for g in render video; do
+            if id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx "$g"; then ok "'$SERVICE_USER' is in group $g"; else warn "'$SERVICE_USER' is not in group $g"; fi
+        done
+        if rb_sudo -u "$SERVICE_USER" ffmpeg -hide_banner -loglevel error -nostdin \
+            -f lavfi -i testsrc2=size=1280x720:rate=30 -t 1 -vaapi_device "$VAAPI_DEVICE" \
+            -vf format=nv12,hwupload -c:v h264_vaapi -rc_mode CQP -qp "$QP" -f null - 2>/dev/null; then
+            ok "1-second hardware test encode succeeded as '$SERVICE_USER'"
+        else
+            bad "hardware test encode failed as '$SERVICE_USER'"
+        fi
+    else
+        bad "service user '$SERVICE_USER' does not exist (run install.sh)"
+    fi
+
+    echo; echo "Services"
+    local u
+    for u in "$RB_RELAY_UNIT" "$RB_FEEDER_UNIT" "$RB_WEBHOOK_UNIT"; do
+        printf '  %-28s enabled=%s active=%s\n' "$u" "$(systemctl is-enabled "$u" 2>/dev/null || echo no)" "$(systemctl is-active "$u" 2>/dev/null || true)"
+    done
+    if [ "$WEBHOOK_BIND" != "127.0.0.1" ]; then warn "webhook listens on $WEBHOOK_BIND (plain HTTP): firewall port $WEBHOOK_PORT to trusted hosts"; fi
+
+    echo
+    if [ "$DOCTOR_FAILS" -eq 0 ]; then echo "All required checks passed."; else echo "$DOCTOR_FAILS check(s) failed."; return 1; fi
+}
+
+cmd_preflight() {
+    as_service_user preflight
+    [ -n "$LIBRARY_DIR" ] || rb_die "LIBRARY_DIR is not set"
+    rb_validate_config || exit 1
+    local fails=0 total=0 f err log
+    log="$(mktemp)"
+    check_dir() {
+        local dir="$1" mode="$2"
+        rb_list_media "$dir"
+        local -a list=("${MEDIA_FILES[@]}")
+        for f in "${list[@]}"; do
+            total=$((total + 1))
+            RB_REALTIME=0 rb_build_cmd "$f" "$mode" - null -t 5
+            if RB_REALTIME=0 "${RB_CMD[@]}" >"$log" 2>&1; then
+                printf 'ok    %s\n' "$(basename "$f")"
+            else
+                fails=$((fails + 1))
+                err="$(grep -v '^\s*$' "$log" | tail -1)"
+                printf 'FAIL  %s\n        %s\n' "$(basename "$f")" "$err"
+            fi
+        done
+    }
+    check_dir "$LIBRARY_DIR" overlay
+    [ -n "$AD_DIR" ] && check_dir "$AD_DIR" plain
+    rm -f "$log"
+    echo
+    echo "$((total - fails)) of $total file(s) passed."
+    if [ "$fails" -gt 0 ]; then
+        echo "Move failing files out of the library (or re-encode them) before going live."
+        return 1
+    fi
+}
+
+cmd_test_encode() {
+    as_service_user test-encode "$@"
+    rb_validate_config || exit 1
+    local f="${1:-}" secs="${2:-20}" offset="${3:-0}"
+    if [ -z "$f" ]; then
+        rb_list_media "$LIBRARY_DIR"
+        [ "${#MEDIA_FILES[@]}" -gt 0 ] || rb_die "no media files in $LIBRARY_DIR"
+        f="${MEDIA_FILES[0]}"
+    fi
+    [ -f "$f" ] || rb_die "file not found: $f"
+    if ! rb_is_int "$secs" || ! rb_is_int "$offset"; then rb_die "SECONDS and OFFSET must be whole numbers"; fi
+
+    local out start end elapsed bytes dur kbps speed
+    out="$(mktemp --suffix=.mp4)"
+    echo "Encoding $secs s of '$(basename "$f")' from offset ${offset}s at qp=$QP, max_fps=$MAX_FPS ..."
+    RB_REALTIME=0 RB_START="$offset" rb_build_cmd "$f" overlay "$out" mp4 -t "$secs"
+    echo "  source:${RB_NOTE:- (frame rate unknown)}"
+    start=$(date +%s.%N)
+    if ! RB_REALTIME=0 RB_START="$offset" "${RB_CMD[@]}"; then
+        rm -f "$out"; rb_die "the encode failed (see ffmpeg output above)"
+    fi
+    end=$(date +%s.%N)
+    elapsed="$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.2f", b-a}')"
+    bytes="$(stat -c %s "$out")"
+    dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" 2>/dev/null)"
+    rm -f "$out"
+    kbps="$(awk -v b="$bytes" -v d="${dur:-$secs}" 'BEGIN{printf "%d", b*8/d/1000}')"
+    speed="$(awk -v d="${dur:-$secs}" -v e="$elapsed" 'BEGIN{printf "%.1f", (e>0)?d/e:0}')"
+    echo
+    echo "  encoded ${dur:-?} s of video in ${elapsed} s  (${speed}x real time)"
+    echo "  average bitrate (video+audio): ${kbps} kbps"
+    if [ "$kbps" -gt "$BITRATE_WARN_KBPS" ]; then
+        echo "  WARNING: above BITRATE_WARN_KBPS (${BITRATE_WARN_KBPS}). Raise QP by 3-4 and test again."
+    fi
+    if awk -v s="$speed" 'BEGIN{exit !(s<1.5)}'; then
+        echo "  WARNING: under 1.5x real time: the encoder may fall behind live pacing on busy scenes."
+    fi
+    echo
+    echo "Constant-quantiser bitrate varies with the scene. Test your busiest clips at"
+    echo "different offsets, and see docs/bitrate-tuning.md."
+}
+
+case "${1:-}" in
+    status)      cmd_status ;;
+    start)       rb_loop_start && echo "Started." ;;
+    stop)        rb_loop_stop && echo "Stopped." ;;
+    restart)     rb_loop_stop && sleep 2 && rb_loop_start && echo "Restarted." ;;
+    reset)       cmd_reset ;;
+    logs)        shift; cmd_logs "$@" ;;
+    doctor)      cmd_doctor ;;
+    preflight)   cmd_preflight ;;
+    test-encode) shift; cmd_test_encode "$@" ;;
+    token)       cmd_token ;;
+    config)      cmd_config ;;
+    version|-v|--version) echo "RerunBox $(rb_version)" ;;
+    ""|help|-h|--help)    usage ;;
+    *)           echo "Unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac

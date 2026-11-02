@@ -1,0 +1,73 @@
+# RerunBox configuration  (installed to /etc/rerunbox/rerunbox.conf)
+#
+# Plain KEY="value" lines. This file is read by shell scripts, so keep values
+# on one line and do not use $, backticks, backslashes or double quotes inside
+# them. Secrets (stream key, webhook token) do NOT go here; they live in
+# /etc/rerunbox/secrets.env. After editing, apply with:  rerunbox restart
+
+# --- Content -----------------------------------------------------------------
+
+# Folder of video files to loop, played in filename order, then repeated.
+# The folder is rescanned at the start of every lap, so you can add or remove
+# files without restarting. Only files directly inside it are used.
+LIBRARY_DIR="/srv/rerunbox/library"
+
+# Optional folder of "ad break" clips. After every AD_INTERVAL library clips,
+# every file in this folder is played once (in filename order). Leave empty to
+# disable. Ad clips are never overlaid and never become the resume position.
+AD_DIR=""
+AD_INTERVAL="2"
+
+# File extensions treated as video (space separated, case-insensitive).
+EXTENSIONS="mkv mp4 mov m4v webm ts avi"
+
+# Optional transparent PNG burned into library clips (e.g. a "REPLAY" badge).
+# Leave empty to disable. A missing file is logged and skipped, never fatal.
+OVERLAY_PNG=""
+# Where it goes, as an ffmpeg overlay expression (W/H = video size, w/h = PNG size).
+OVERLAY_POS="x=W-w-40:y=40"
+
+# --- Encoder -----------------------------------------------------------------
+
+# Only Intel VAAPI is supported.
+ENCODER="vaapi"
+VAAPI_DEVICE="/dev/dri/renderD128"
+
+# Constant-quantiser value. LOWER = better quality = HIGHER bitrate.
+# Intel's VAAPI encoder cannot cap bitrate, so this is the only lever you have
+# and the resulting bitrate depends on how busy your footage is. Do not just
+# trust the default: run `rerunbox test-encode` on your heaviest clip and read
+# docs/bitrate-tuning.md before going live.
+QP="28"
+
+# Sources faster than this are reduced to it (60 fps -> 30 fps by default).
+# Fewer frames means fewer bits, which keeps the bitrate predictable.
+MAX_FPS="30"
+
+# Keyframe spacing in seconds (Twitch and YouTube want 2 or less).
+KEYFRAME_SECONDS="2"
+AUDIO_BITRATE="160k"
+
+# `rerunbox test-encode` prints a warning when a test exceeds this (kbps).
+# Set it to your destination's recommended maximum.
+BITRATE_WARN_KBPS="8500"
+
+# --- Scheduled restart -------------------------------------------------------
+
+# Restart the whole pipeline every N hours to get a fresh connection, which
+# helps platforms that silently drop very long streams (0 disables). The
+# restart is skipped automatically if the loop was stopped on purpose.
+RESTART_INTERVAL_HOURS="12"
+
+# --- Webhook (start/stop/reset from a Stream Deck, script, etc.) -------------
+
+# 127.0.0.1 = only this machine. Use the machine's LAN address (or 0.0.0.0) to
+# allow other devices, and firewall the port to trusted hosts: the webhook is
+# plain HTTP with a shared token. See docs/webhook.md.
+WEBHOOK_BIND="127.0.0.1"
+WEBHOOK_PORT="8787"
+
+# --- Service -----------------------------------------------------------------
+
+SERVICE_USER="rerunbox"
+STATE_DIR="/var/lib/rerunbox"

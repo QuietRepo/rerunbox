@@ -1,0 +1,22 @@
+[Unit]
+Description=RerunBox feeder - plays the library into the relay FIFO
+After=network-online.target rerunbox-relay.service
+Wants=network-online.target
+Requires=rerunbox-relay.service
+# The installer adds a drop-in (rerunbox-feeder.service.d/media.conf) with
+# RequiresMountsFor= for your library and ad folders, so a NAS or external
+# drive that is not mounted yet blocks start-up instead of looping on nothing.
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+ExecStart=@PREFIX@/bin/rerunbox-feeder
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

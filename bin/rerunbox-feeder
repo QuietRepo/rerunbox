@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# rerunbox-feeder: plays the library, one clip at a time, into the relay FIFO.
+#
+# Each clip gets its own fresh ffmpeg process, so there is no shared decoder
+# state to corrupt when codecs differ between files, and every clip's
+# timestamps are reset to zero before it is written. The FIFO is held open on
+# fd 3 so the relay never sees EOF between clips.
+set -u
+RB_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$RB_ROOT/lib/common.sh"
+# shellcheck source=../lib/pipeline.sh
+. "$RB_ROOT/lib/pipeline.sh"
+rb_load_config
+
+rb_validate_config || rb_die "invalid configuration, see messages above"
+[ -n "$LIBRARY_DIR" ] || rb_die "LIBRARY_DIR is not set in $RB_CONF"
+
+mkdir -p "$STATE_DIR"
+[ -p "$FIFO" ] || mkfifo -m 600 "$FIFO"
+exec 3>"$FIFO"   # blocks until the relay has the other end open
+
+FFMPEG_PID=""
+
+cleanup() {
+    rb_log "Received stop signal, terminating ffmpeg (PID ${FFMPEG_PID:-none})"
+    if [ -n "$FFMPEG_PID" ]; then
+        kill -TERM "$FFMPEG_PID" 2>/dev/null
+        wait "$FFMPEG_PID" 2>/dev/null
+    fi
+    exit 0
+}
+# ffmpeg runs as a background job and we `wait` on it so that this trap fires
+# immediately. With a plain foreground ffmpeg, bash would defer SIGTERM until
+# the current clip finished (potentially hours).
+trap cleanup SIGTERM SIGINT
+
+# --- Resume-from-position ----------------------------------------------------
+# The currently playing library file is recorded so a restart (or reboot)
+# carries on from that clip instead of always going back to the first one.
+# File-level only: a restart replays the interrupted clip from its start.
+# Never written for ad clips.
+
+write_state() { printf '%s\n' "$1" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"; }
+read_state()  { [ -f "$STATE_FILE" ] && cat "$STATE_FILE"; }
+
+play_file() {
+    local f="$1" mode="${2:-plain}" started rc
+    rb_build_cmd "$f" "$mode" "$FIFO" mpegts
+    rb_log "Feeding: $(basename "$f") [$mode]${RB_NOTE}"
+    started=$SECONDS
+    "${RB_CMD[@]}" &
+    FFMPEG_PID=$!
+    wait "$FFMPEG_PID"
+    rc=$?
+    FFMPEG_PID=""
+    if [ "$rc" -ne 0 ]; then
+        rb_warn "ffmpeg exited with status $rc for $(basename "$f"); moving on"
+        # Don't spin if every file is failing instantly (bad encoder setup, etc.)
+        [ $((SECONDS - started)) -lt 3 ] && sleep 3
+    fi
+}
+
+play_ad_break() {
+    [ -n "$AD_DIR" ] || return 0
+    rb_list_media "$AD_DIR"
+    if [ "${#MEDIA_FILES[@]}" -eq 0 ]; then
+        rb_log "Ad break due but $AD_DIR has no media files, skipping"
+        return 0
+    fi
+    local -a ads=("${MEDIA_FILES[@]}") ad
+    rb_log "--- Ad break: ${#ads[@]} file(s) ---"
+    for ad in "${ads[@]}"; do
+        play_file "$ad" plain
+    done
+}
+
+# --- Main loop ---------------------------------------------------------------
+
+rb_log "RerunBox feeder $(rb_version) starting: encoder=$ENCODER qp=$QP max_fps=$MAX_FPS library=$LIBRARY_DIR"
+
+resume_from="$(read_state)"
+clip_count=0
+
+while true; do
+    rb_list_media "$LIBRARY_DIR"
+    if [ "${#MEDIA_FILES[@]}" -eq 0 ]; then
+        rb_log "No media files found in $LIBRARY_DIR, retrying in 30s"
+        sleep 30
+        continue
+    fi
+    files=("${MEDIA_FILES[@]}")
+
+    start_index=0
+    if [ -n "$resume_from" ]; then
+        for i in "${!files[@]}"; do
+            if [ "${files[$i]}" = "$resume_from" ]; then
+                start_index=$i
+                rb_log "Resuming from last known file: $(basename "$resume_from")"
+                break
+            fi
+        done
+        resume_from=""   # only honoured once, at process start
+    fi
+
+    for ((i = start_index; i < ${#files[@]}; i++)); do
+        f="${files[$i]}"
+        write_state "$f"
+        play_file "$f" overlay
+        clip_count=$((clip_count + 1))
+        if [ -n "$AD_DIR" ] && (( clip_count % AD_INTERVAL == 0 )); then
+            play_ad_break
+        fi
+    done
+done

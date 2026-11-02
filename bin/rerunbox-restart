@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# rerunbox-restart: scheduled full-pipeline bounce, run by rerunbox-restart.timer.
+#
+# Why: some platforms silently drop streams that run for a very long time
+# (Twitch after ~48 h, and YouTube stops producing a clean archive around 12 h).
+# Restarting on our own schedule gives a fresh connection before that happens.
+#
+# It is skipped when the loop is not running, so it never starts the loop
+# underneath you while you are live on the same stream key, or after you
+# stopped it on purpose. The next timer firing simply tries again.
+set -u
+RB_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$RB_ROOT/lib/common.sh"
+rb_load_config
+
+if ! systemctl is-active --quiet "$RB_RELAY_UNIT"; then
+    rb_log "Scheduled restart: SKIPPED (loop not running)"
+    exit 0
+fi
+
+rb_log "Scheduled restart: stopping feeder + relay"
+rb_loop_stop
+
+sleep 2
+
+rb_log "Scheduled restart: starting relay + feeder"
+rb_loop_start
+rb_log "Scheduled restart: complete"
+
+if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+    # Plain ASCII on purpose: non-ASCII characters in the payload have caused
+    # HTTP 400s from Discord when posted from a systemd service context.
+    MSG="RerunBox scheduled restart fired at $(date -u '+%Y-%m-%d %H:%M:%S UTC'). Pipeline bounced; your destination should reconnect within a few seconds."
+    PAYLOAD="$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps({"content": sys.stdin.read()}))')"
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+        -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL")"
+    case "$code" in
+        2[0-9][0-9]) : ;;
+        *) rb_warn "Discord webhook post failed (HTTP $code)" ;;
+    esac
+fi

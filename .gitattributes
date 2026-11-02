@@ -1,0 +1,4 @@
+# Shell scripts and unit files must keep LF line endings, even when checked out
+# on Windows, or bash and systemd will choke on the carriage returns.
+* text=auto eol=lf
+*.png binary

@@ -1,0 +1,9 @@
+# Installed to /etc/sudoers.d/rerunbox by install.sh. Lets the RerunBox service
+# user start/stop its own units (needed by the webhook and the scheduled
+# restart) and nothing else.
+Cmnd_Alias RERUNBOX_CTL = \
+    @SYSTEMCTL@ start rerunbox-relay.service, \
+    @SYSTEMCTL@ stop rerunbox-relay.service, \
+    @SYSTEMCTL@ start rerunbox-feeder.service, \
+    @SYSTEMCTL@ stop rerunbox-feeder.service
+@USER@ ALL=(root) NOPASSWD: RERUNBOX_CTL

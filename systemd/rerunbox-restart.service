@@ -1,0 +1,11 @@
+[Unit]
+Description=RerunBox scheduled restart (relay + feeder)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+ExecStart=@PREFIX@/bin/rerunbox-restart
+StandardOutput=journal
+StandardError=journal

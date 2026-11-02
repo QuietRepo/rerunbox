@@ -1,0 +1,17 @@
+[Unit]
+Description=RerunBox relay - persistent RTMP connection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+ExecStart=@PREFIX@/bin/rerunbox-relay
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
