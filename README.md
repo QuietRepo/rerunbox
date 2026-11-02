@@ -54,6 +54,26 @@ crash the outgoing stream.
 A headless mini PC with an i3 is plenty. Encoding happens on the GPU, so the CPU
 mostly idles.
 
+### Tested on
+
+The streaming pipeline has run 24/7 on this machine:
+
+| | |
+|---|---|
+| Machine | Dell OptiPlex 3040, headless |
+| CPU / GPU | Intel Core i3-6100T (Skylake, 2 cores / 4 threads), HD Graphics 530 |
+| RAM | about 14 GiB usable |
+| OS | Ubuntu 26.04.1 LTS, kernel 7.0.0-34-generic |
+| ffmpeg | 8.0.1 (Ubuntu package `8.0.1-3ubuntu2`) |
+| VA driver | Intel iHD 26.1.2 |
+| Workload | 1080p30 H.264 to Twitch and YouTube via Restream, library read from a NAS over SMB |
+
+On that machine the CPU sits mostly idle and the GPU's encoder engine is lightly
+loaded. The automated test suite (software encoder only) also passes on ffmpeg 6.1.1.
+
+Other hardware and distributions are untested. If you run it somewhere else, please
+open an issue with your results from `rerunbox doctor`, whether it works or not.
+
 ## Install
 
 ```bash
